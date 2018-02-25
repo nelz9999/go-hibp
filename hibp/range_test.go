@@ -22,19 +22,16 @@ package hibp
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/nelz9999/go-hibp/generate/client"
 )
 
 const minResultLines = 381
@@ -49,24 +46,15 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:23
 `
 
 func TestFind(t *testing.T) {
-	port := 9000 + (time.Now().Unix() % 1000)
-	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(data))
 	}))
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		t.Fatalf("unexpected: %v\n", err)
-	}
-	ts.Listener = l
-	ts.StartTLS()
 	defer ts.Close()
 
-	host := fmt.Sprintf("127.0.0.1:%d", port)
-	cfg := client.DefaultTransportConfig().WithHost(host)
-	f := &finder{
-		cli:  client.NewHTTPClientWithConfig(nil, cfg),
-		conn: ts.Client(),
-	}
+	f := NewFinder(
+		WithClient(ts.Client()),
+		WithURLTemplate(fmt.Sprintf("%s/%%s", ts.URL)),
+	)
 
 	testCases := []struct {
 		pwd string
@@ -101,23 +89,14 @@ func TestFind(t *testing.T) {
 }
 
 func TestFindErrors(t *testing.T) {
-	port := 9000 + (time.Now().Unix() % 1000)
-	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(429) // Throttled
 	}))
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		t.Fatalf("unexpected: %v\n", err)
-	}
-	ts.Listener = l
-	ts.StartTLS()
 	defer ts.Close()
 
-	host := fmt.Sprintf("127.0.0.1:%d", port)
-	cfg := client.DefaultTransportConfig().WithHost(host)
-	f := &finder{
-		cli:  client.NewHTTPClientWithConfig(nil, cfg),
+	f := &Finder{
 		conn: ts.Client(),
+		tmpl: fmt.Sprintf("%s/%%s", ts.URL),
 	}
 
 	alpha := []byte("abcdefghijklmnopqrstuvwxyz")
@@ -170,7 +149,7 @@ func TestIntegrationFetch(t *testing.T) {
 	rand.Read(b)
 	prefix := []byte(fmt.Sprintf("%5X", b))[:prefixSize]
 
-	f := &finder{}
+	f := NewFinder()
 	body, err := f.fetchPrefix(prefix)
 	if err != nil {
 		t.Errorf("unexpected: %v\n", err)
@@ -178,7 +157,7 @@ func TestIntegrationFetch(t *testing.T) {
 
 	verbose := os.Getenv("VERBOSE") != ""
 	size := 0
-	buf := bufio.NewReader(strings.NewReader(body))
+	buf := bufio.NewReader(bytes.NewReader(body))
 	for {
 		buf, _, err := buf.ReadLine()
 		if err != nil {

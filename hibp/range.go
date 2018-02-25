@@ -18,8 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-// Package hibp ("Have I beep pwned?") provides a minor go wrapper around
-// Troy Hunt's Pwned Passwords k-Anonymity API
+// Package hibp ("Have I beep pwned?") provides a go wrapper around
+// Troy Hunt's Pwned Passwords k-Anonymity API.
+//
+// See more here:
+// https://www.troyhunt.com/ive-just-launched-pwned-passwords-version-2/ and
+// https://haveibeenpwned.com/API/v2#SearchingPwnedPasswordsByRange
 package hibp
 
 import (
@@ -28,28 +32,75 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strconv"
-	"strings"
-
-	"github.com/nelz9999/go-hibp/generate/client"
-	"github.com/nelz9999/go-hibp/generate/client/operations"
 )
 
-const defaultHost = "api.pwnedpasswords.com"
-const defaultScheme = "https"
 const prefixSize = 5
 
 var delim = []byte(":")
 
 const errMsgFormat = "hibp: problem parsing results"
 
-type finder struct {
-	cli  *client.HaveIBeenPwned
+// DefaultTemplate creates URLs pointing to the original Pwned Passwords API
+const DefaultTemplate = "https://api.pwnedpasswords.com/range/%s"
+
+// NewFinder returns a new Finder, set up with the options provided.
+func NewFinder(options ...func(*Finder)) *Finder {
+	f := &Finder{
+		tmpl: DefaultTemplate,
+		conn: http.DefaultClient,
+	}
+	for _, opt := range options {
+		opt(f)
+	}
+	return f
+}
+
+// WithURLTemplate replaces the DefaultTemplate to build the URL to fetch.
+//
+// This is useful to retrieve from a different hosted solution.
+//
+// (It is possible to download and self-host the data, see the "Downloading
+// the Data" section at
+// https://www.troyhunt.com/ive-just-launched-pwned-passwords-version-2/)
+func WithURLTemplate(template string) func(f *Finder) {
+	return func(f *Finder) {
+		f.tmpl = template
+	}
+}
+
+// WithClient replaces the http.DefaultClient
+func WithClient(client *http.Client) func(f *Finder) {
+	return func(f *Finder) {
+		f.conn = client
+	}
+}
+
+// Finder looks for reported password breaches.
+type Finder struct {
+	tmpl string
 	conn *http.Client
 }
 
-func (f *finder) Find(sum []byte) (int64, error) {
+// Find takes the 20 byte output of a sha1.Sum(), and retrieves the count
+// of time that the source string has been found in breaches. A zero (without
+// an error) means there's no evidence that the given string has had a
+// previous breach.
+//
+// (Some passwords have been breached THOUSANDS of times, most of the entries
+// have only been seen a handful of times. It is up to the consumer to decide
+// what effect these counts have on your password policy. See the section "Each
+// Password Now Has a Count Next to It" at
+// https://www.troyhunt.com/ive-just-launched-pwned-passwords-version-2/)
+//
+// The only information sent upstream is the first 5 hex digits of the
+// provided SHA1, the rest of the matching is done locally. (For more
+// information on why this is, see the section "Cloudflare, Privacy and
+// k-Anonymity" at
+// https://www.troyhunt.com/ive-just-launched-pwned-passwords-version-2/)
+func (f *Finder) Find(sum []byte) (int64, error) {
 	if len(sum) < sha1.Size {
 		return 0, io.ErrShortBuffer
 	}
@@ -62,7 +113,7 @@ func (f *finder) Find(sum []byte) (int64, error) {
 		return 0, err
 	}
 
-	line, err := findSuffix(full[prefixSize:], strings.NewReader(body))
+	line, err := findSuffix(full[prefixSize:], bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
@@ -72,19 +123,17 @@ func (f *finder) Find(sum []byte) (int64, error) {
 	return parseCount(line)
 }
 
-func (f *finder) fetchPrefix(prefix []byte) (string, error) {
-	ops := client.Default.Operations
-	if f != nil && f.cli != nil {
-		ops = f.cli.Operations
-	}
-	params := operations.NewRangeParams().
-		WithHTTPClient(f.conn).
-		WithPrefix(string(prefix))
-	resp, err := ops.Range(params)
+func (f *Finder) fetchPrefix(prefix []byte) ([]byte, error) {
+	url := fmt.Sprintf(f.tmpl, prefix)
+	resp, err := f.conn.Get(url)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return resp.Payload, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf(resp.Status)
+	}
+	return ioutil.ReadAll(resp.Body)
 }
 
 func findSuffix(suffix []byte, content io.Reader) ([]byte, error) {
